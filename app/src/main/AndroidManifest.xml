@@ -12,6 +12,10 @@
         <meta-data android:name="xposedsharedprefs" android:value="true" />
         <meta-data android:name="xposedscope" android:resource="@array/scope" />
 
+        <receiver
+            android:name=".DebugReceiver"
+            android:exported="true" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">

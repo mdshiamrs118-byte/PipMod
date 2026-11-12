@@ -1,6 +1,9 @@
 package com.pipmod.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
@@ -48,6 +51,11 @@ public class MainActivity extends Activity {
         restart.setOnClickListener(v -> restartSystemUi());
         root.addView(restart);
 
+        Button debug = new Button(this);
+        debug.setText("Show debug info");
+        debug.setOnClickListener(v -> showDebug());
+        root.addView(debug);
+
         Switch pinch = new Switch(this);
         pinch.setText("Enable two-finger pinch zoom");
         pinch.setChecked(sp.getBoolean("pinch_enabled", true));
@@ -68,6 +76,33 @@ public class MainActivity extends Activity {
         ScrollView sv = new ScrollView(this);
         sv.addView(root);
         setContentView(sv);
+    }
+
+    private void showDebug() {
+        SharedPreferences d = getSharedPreferences("debug", Context.MODE_PRIVATE);
+        final String text = d.getString("text", null);
+        TextView tv = new TextView(this);
+        tv.setTextIsSelectable(true);
+        tv.setTextSize(11);
+        tv.setPadding(dp(12), dp(12), dp(12), dp(12));
+        tv.setText(text == null
+                ? "Nothing received yet. Make sure the module is enabled for System UI, "
+                + "restart System UI, then start a PiP window and reopen this screen."
+                : text);
+        ScrollView s = new ScrollView(this);
+        s.addView(tv);
+        AlertDialog.Builder bld = new AlertDialog.Builder(this)
+                .setTitle("Debug info")
+                .setView(s)
+                .setPositiveButton("Close", null);
+        if (text != null) {
+            bld.setNeutralButton("Copy", (dlg, w) -> {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(ClipData.newPlainText("PipMod debug", text));
+                Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+            });
+        }
+        bld.show();
     }
 
     private void restartSystemUi() {

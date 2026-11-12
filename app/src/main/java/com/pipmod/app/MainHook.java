@@ -1,6 +1,10 @@
 package com.pipmod.app;
 
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
 import android.content.res.Resources;
+import android.graphics.Point;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -15,7 +19,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Hooks SystemUI's PiP classes on Android 11.
- * Everything is wrapped in try/catch and heavily logged (search "PipMod" in the LSPosed log).
+ * Everything is wrapped in try/catch and logged to the LSPosed log AND
+ * sent to the app (button "Show debug info").
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -28,9 +33,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String[] BOUNDS_HANDLER = {
             "com.android.systemui.pip.PipBoundsHandler",
             "com.android.wm.shell.pip.PipBoundsHandler"};
+    private static final String[] SNAP_ALGORITHM = {
+            "com.android.systemui.pip.PipSnapAlgorithm",
+            "com.android.wm.shell.pip.PipSnapAlgorithm"};
     private static final String[] RESIZE_HANDLER = {
             "com.android.systemui.pip.phone.PipResizeGestureHandler",
             "com.android.wm.shell.pip.phone.PipResizeGestureHandler"};
+    private static final String[] TOUCH_HANDLER = {
+            "com.android.systemui.pip.phone.PipTouchHandler",
+            "com.android.wm.shell.pip.phone.PipTouchHandler"};
 
     private XSharedPreferences prefs;
 
@@ -53,13 +64,15 @@ public class MainHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
         if (!"com.android.systemui".equals(lpp.packageName)) return;
-        log("Loaded into SystemUI (module is active)");
+        log("v1.2 loaded into SystemUI");
 
         try {
             XSharedPreferences p = prefs();
             log("Prefs file: " + p.getFile() + " readable=" + p.getFile().canRead()
                     + " corner_dp=" + p.getInt("corner_dp", -1)
-                    + " default_percent=" + p.getInt("default_percent", -1));
+                    + " default_percent=" + p.getInt("default_percent", -1)
+                    + " min_percent=" + p.getInt("min_percent", -1)
+                    + " max_percent=" + p.getInt("max_percent", -1));
         } catch (Throwable t) {
             logErr("prefs check", t);
         }
@@ -68,6 +81,9 @@ public class MainHook implements IXposedHookLoadPackage {
         hookPinchFlag(lpp);
         hookResizeHandler(lpp);
         hookDefaultSize(lpp);
+
+        Class<?> touch = findFirst(lpp, TOUCH_HANDLER);
+        if (touch != null) dump(touch);
     }
 
     // ---------------------------------------------------------------- corner radius
@@ -88,7 +104,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 @Override
                 protected void afterHookedMethod(MethodHookParam p) {
-                    // Apply the radius ourselves, so it works even if the field type/name differs.
                     try {
                         if (p.args.length >= 3 && p.args[2] instanceof Boolean
                                 && (Boolean) p.args[2]) {
@@ -122,15 +137,15 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ---------------------------------------------------------------- pinch flag
-    /** Pinch resize is gated by DeviceConfig flag "pip_pinch_resize"; force it on. */
     private void hookPinchFlag(XC_LoadPackage.LoadPackageParam lpp) {
         XC_MethodHook flagHook = new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam p) {
                 try {
                     for (Object a : p.args) {
-                        if ("pip_pinch_resize".equals(a) && prefs().getBoolean("pinch_enabled", true)) {
-                            p.setResult(true);
+                        if ("pip_pinch_resize".equals(a)) {
+                            log("flag pip_pinch_resize queried -> forcing true");
+                            if (prefs().getBoolean("pinch_enabled", true)) p.setResult(true);
                             return;
                         }
                     }
@@ -171,19 +186,24 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllConstructors(c, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam p) {
+                    log("PipResizeGestureHandler constructed");
                     forceEnable(p.thisObject);
-                }
-            });
-            XposedBridge.hookAllMethods(c, "onInputEvent", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    forceEnable(p.thisObject);
+                    flush();
                 }
             });
             XposedBridge.hookAllMethods(c, "onActivityPinned", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam p) {
+                    log("onActivityPinned");
                     forceEnable(p.thisObject);
+                    forceMinMaxFields(p.thisObject);
+                    flush();
+                }
+            });
+            XposedBridge.hookAllMethods(c, "onInputEvent", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    forceMinMaxFields(p.thisObject);
                 }
             });
 
@@ -210,24 +230,65 @@ public class MainHook implements IXposedHookLoadPackage {
                     n++;
                 }
             }
-            log("min/max size hooks: " + n);
+            log("min/max update-method hooks: " + n);
         } catch (Throwable t) {
             logErr("resize handler", t);
         }
     }
 
+    /** Turns on every boolean field that looks like an "enabled" flag, then re-inits input. */
     private void forceEnable(Object handler) {
-        if (!prefs().getBoolean("pinch_enabled", true)) return;
-        for (String n : new String[]{"mIsEnabled", "mEnablePinchResize", "mIsPinchResizeEnabled"}) {
-            try {
-                Field f = findField(handler.getClass(), n);
-                if (f != null && f.getType() == boolean.class) {
-                    f.setAccessible(true);
-                    f.setBoolean(handler, true);
+        try {
+            if (!prefs().getBoolean("pinch_enabled", true)) return;
+            boolean changed = false;
+            Class<?> c = handler.getClass();
+            while (c != null && c != Object.class) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (f.getType() == boolean.class
+                            && f.getName().toLowerCase().contains("enable")) {
+                        f.setAccessible(true);
+                        if (!f.getBoolean(handler)) {
+                            f.setBoolean(handler, true);
+                            changed = true;
+                            log("forced " + f.getName() + " = true");
+                        }
+                    }
                 }
-            } catch (Throwable ignored) {
+                c = c.getSuperclass();
             }
+            if (changed) {
+                try {
+                    XposedHelpers.callMethod(handler, "updateIsEnabled");
+                    log("called updateIsEnabled()");
+                } catch (Throwable t) {
+                    log("updateIsEnabled() unavailable: " + t);
+                }
+            }
+        } catch (Throwable t) {
+            logErr("forceEnable", t);
         }
+    }
+
+    /** Fallback: write min/max Point fields directly, keeping their aspect ratio. */
+    private void forceMinMaxFields(Object handler) {
+        try {
+            applyPointField(handler, "mMinSize", prefs().getInt("min_percent", 30));
+            applyPointField(handler, "mMaxSize", prefs().getInt("max_percent", 90));
+        } catch (Throwable t) {
+            logErr("forceMinMaxFields", t);
+        }
+    }
+
+    private void applyPointField(Object o, String name, int pct) throws Exception {
+        Field f = findField(o.getClass(), name);
+        if (f == null || f.getType() != Point.class) return;
+        f.setAccessible(true);
+        Point pt = (Point) f.get(o);
+        if (pt == null || pt.x <= 0 || pt.y <= 0) return;
+        float ratio = pt.y / (float) pt.x;
+        int nx = Math.round(screenWidthPx() * pct / 100f);
+        pt.x = nx;
+        pt.y = Math.round(nx * ratio);
     }
 
     private void overrideSize(XC_MethodHook.MethodHookParam p, String key, int def) {
@@ -247,42 +308,64 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ---------------------------------------------------------------- default size
+    /**
+     * On Android 11 the default PiP size comes from PipSnapAlgorithm:
+     * minSize = max(minEdge, smallestDisplaySide * mDefaultSizePercent).
+     */
     private void hookDefaultSize(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            Class<?> c = findFirst(lpp, BOUNDS_HANDLER);
-            if (c == null) {
-                log("PipBoundsHandler NOT FOUND");
-                return;
-            }
-            dump(c);
+            Class<?> snap = findFirst(lpp, SNAP_ALGORITHM);
+            if (snap != null) {
+                dump(snap);
+                XC_MethodHook h = new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        setDefaultSize(p.thisObject);
+                        flush();
+                    }
 
-            XC_MethodHook h = new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam p) {
-                    setDefaultSize(p.thisObject);
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        setDefaultSize(p.thisObject);
+                    }
+                };
+                XposedBridge.hookAllConstructors(snap, h);
+                int n = 0;
+                for (Method m : snap.getDeclaredMethods()) {
+                    String name = m.getName().toLowerCase();
+                    if (name.contains("size") || name.contains("reload")) {
+                        XposedBridge.hookMethod(m, h);
+                        n++;
+                    }
                 }
-            };
-            XposedBridge.hookAllConstructors(c, h);
-            XposedBridge.hookAllMethods(c, "reloadResources", h);
-            XposedBridge.hookAllMethods(c, "onConfigurationChanged", h);
-            // Also re-apply right before bounds are computed.
-            XposedBridge.hookAllMethods(c, "getDefaultBounds", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    setDefaultSize(p.thisObject);
-                }
-            });
+                log("PipSnapAlgorithm hooks: " + n);
+            } else {
+                log("PipSnapAlgorithm NOT FOUND");
+            }
+
+            Class<?> c = findFirst(lpp, BOUNDS_HANDLER);
+            if (c != null) {
+                dump(c);
+                XC_MethodHook h2 = new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        setDefaultSize(p.thisObject);
+                    }
+                };
+                XposedBridge.hookAllConstructors(c, h2);
+                XposedBridge.hookAllMethods(c, "reloadResources", h2);
+            } else {
+                log("PipBoundsHandler NOT FOUND");
+            }
         } catch (Throwable t) {
             logErr("default size", t);
         }
     }
 
-    private void setDefaultSize(Object handler) {
+    private void setDefaultSize(Object obj) {
         try {
             float pct = prefs().getInt("default_percent", 50) / 100f;
-            if (!setNumber(handler, "mDefaultSizePercent", pct)) {
-                log("mDefaultSizePercent not found");
-            }
+            setNumber(obj, "mDefaultSizePercent", pct);
         } catch (Throwable t) {
             logErr("setDefaultSize", t);
         }
@@ -330,7 +413,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Logs fields and methods so we can fix names for your exact build. */
     private static void dump(Class<?> c) {
         try {
             StringBuilder sb = new StringBuilder("Dump " + c.getName() + "\n  fields:");
@@ -339,18 +421,54 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             sb.append("\n  methods:");
             for (Method m : c.getDeclaredMethods()) {
-                sb.append(' ').append(m.getName()).append('/').append(m.getParameterTypes().length).append(';');
+                sb.append(' ').append(m.getName()).append('(');
+                Class<?>[] pt = m.getParameterTypes();
+                for (int i = 0; i < pt.length; i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(pt[i].getSimpleName());
+                }
+                sb.append(");");
             }
             log(sb.toString());
         } catch (Throwable ignored) {
         }
     }
 
-    private static void log(String s) {
+    // ---------------------------------------------------------------- logging / reporting
+    private static final StringBuilder REPORT = new StringBuilder();
+    private static boolean dirty;
+    private static long lastFlush;
+
+    private static synchronized void log(String s) {
         XposedBridge.log(TAG + s);
+        if (REPORT.length() > 150000) REPORT.delete(0, 50000);
+        REPORT.append(s).append("\n\n");
+        dirty = true;
+        flush();
     }
 
     private static void logErr(String what, Throwable t) {
-        XposedBridge.log(TAG + "Failed: " + what + " -> " + t);
+        log("Failed: " + what + " -> " + t);
+    }
+
+    /** Sends the report to the module app (shown under "Show debug info"). */
+    private static synchronized void flush() {
+        try {
+            if (!dirty) return;
+            long now = System.currentTimeMillis();
+            if (now - lastFlush < 1500) return;
+            Object app = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.app.ActivityThread", null),
+                    "currentApplication");
+            if (!(app instanceof Context)) return;
+            lastFlush = now;
+            dirty = false;
+            Intent i = new Intent("com.pipmod.app.DEBUG");
+            i.setComponent(new ComponentName(PKG, PKG + ".DebugReceiver"));
+            i.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            i.putExtra("text", REPORT.toString());
+            ((Context) app).sendBroadcast(i);
+        } catch (Throwable ignored) {
+        }
     }
 }
