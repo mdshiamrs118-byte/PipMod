@@ -4,7 +4,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
-import android.view.Gravity;
+import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -20,7 +20,6 @@ public class MainActivity extends Activity {
     @SuppressWarnings({"deprecation", "WorldReadableFiles"})
     private SharedPreferences openPrefs() {
         try {
-            // Works when the module is active in LSPosed (xposedsharedprefs).
             return getSharedPreferences("settings", Context.MODE_WORLD_READABLE);
         } catch (SecurityException e) {
             Toast.makeText(this, "Module not active in LSPosed - settings won't apply",
@@ -40,11 +39,15 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView info = new TextView(this);
-        info.setText("Enable this module in LSPosed with scope \"System UI\", then restart "
-                + "SystemUI (or reboot). Changes apply the next time a PiP window is created.");
+        info.setText("Enable this module in LSPosed with scope \"System UI\", change the "
+                + "settings, then tap \"Restart System UI\" and open a new PiP window.");
         root.addView(info);
 
-        // Pinch toggle
+        Button restart = new Button(this);
+        restart.setText("Restart System UI (root)");
+        restart.setOnClickListener(v -> restartSystemUi());
+        root.addView(restart);
+
         Switch pinch = new Switch(this);
         pinch.setText("Enable two-finger pinch zoom");
         pinch.setChecked(sp.getBoolean("pinch_enabled", true));
@@ -67,7 +70,23 @@ public class MainActivity extends Activity {
         setContentView(sv);
     }
 
-    private void addSlider(LinearLayout parent, String label, final String key,
+    private void restartSystemUi() {
+        new Thread(() -> {
+            String msg;
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "killall com.android.systemui || pkill -f com.android.systemui"});
+                int code = p.waitFor();
+                msg = code == 0 ? "System UI restarting..." : "Command failed (exit " + code + ")";
+            } catch (Exception e) {
+                msg = "Root not available: " + e.getMessage();
+            }
+            final String m = msg;
+            runOnUiThread(() -> Toast.makeText(this, m, Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
+    private void addSlider(LinearLayout parent, final String label, final String key,
                            final int min, int max, int def, final String unit) {
         final TextView tv = new TextView(this);
         tv.setPadding(0, dp(16), 0, 0);
@@ -82,7 +101,7 @@ public class MainActivity extends Activity {
             @Override
             public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
                 int v = p + min;
-                tv.setText(label(tv.getText().toString()) + ": " + v + unit);
+                tv.setText(label + ": " + v + unit);
                 if (fromUser) sp.edit().putInt(key, v).apply();
             }
 
@@ -90,11 +109,6 @@ public class MainActivity extends Activity {
             @Override public void onStopTrackingTouch(SeekBar s) { }
         });
         parent.addView(sb);
-    }
-
-    private static String label(String text) {
-        int i = text.lastIndexOf(':');
-        return i > 0 ? text.substring(0, i) : text;
     }
 
     private int dp(int v) {
