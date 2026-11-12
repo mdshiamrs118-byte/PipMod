@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">PiP Mod</string>
+    <string name="xposed_desc">Customize Picture-in-Picture: pinch zoom, size limits, corner radius</string>
+</resources>
