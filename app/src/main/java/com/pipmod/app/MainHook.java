@@ -4,7 +4,8 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.Resources;
-import android.graphics.Point;
+import android.view.InputEvent;
+import android.view.MotionEvent;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -64,7 +65,7 @@ public class MainHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
         if (!"com.android.systemui".equals(lpp.packageName)) return;
-        log("v1.2 loaded into SystemUI");
+        log("v1.3 loaded into SystemUI");
 
         try {
             XSharedPreferences p = prefs();
@@ -78,12 +79,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         hookCornerRadius(lpp);
-        hookPinchFlag(lpp);
-        hookResizeHandler(lpp);
+        hookPinch(lpp);
         hookDefaultSize(lpp);
-
-        Class<?> touch = findFirst(lpp, TOUCH_HANDLER);
-        if (touch != null) dump(touch);
     }
 
     // ---------------------------------------------------------------- corner radius
@@ -136,174 +133,53 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ---------------------------------------------------------------- pinch flag
-    private void hookPinchFlag(XC_LoadPackage.LoadPackageParam lpp) {
-        XC_MethodHook flagHook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                try {
-                    for (Object a : p.args) {
-                        if ("pip_pinch_resize".equals(a)) {
-                            log("flag pip_pinch_resize queried -> forcing true");
-                            if (prefs().getBoolean("pinch_enabled", true)) p.setResult(true);
-                            return;
-                        }
-                    }
-                } catch (Throwable t) {
-                    logErr("flag", t);
-                }
-            }
-        };
-        try {
-            Class<?> dc = XposedHelpers.findClass("android.provider.DeviceConfig", lpp.classLoader);
-            log("DeviceConfig.getBoolean hooks: "
-                    + XposedBridge.hookAllMethods(dc, "getBoolean", flagHook).size());
-        } catch (Throwable t) {
-            logErr("DeviceConfig", t);
-        }
-        try {
-            Class<?> proxy = XposedHelpers.findClassIfExists(
-                    "com.android.systemui.util.DeviceConfigProxy", lpp.classLoader);
-            if (proxy != null) {
-                log("DeviceConfigProxy.getBoolean hooks: "
-                        + XposedBridge.hookAllMethods(proxy, "getBoolean", flagHook).size());
-            }
-        } catch (Throwable t) {
-            logErr("DeviceConfigProxy", t);
-        }
-    }
+    // ---------------------------------------------------------------- pinch zoom (own implementation)
+    private PinchController pinch;
 
-    // ---------------------------------------------------------------- pinch zoom + min/max
-    private void hookResizeHandler(XC_LoadPackage.LoadPackageParam lpp) {
+    private void hookPinch(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            Class<?> c = findFirst(lpp, RESIZE_HANDLER);
-            if (c == null) {
-                log("PipResizeGestureHandler NOT FOUND");
+            Class<?> rh = findFirst(lpp, RESIZE_HANDLER);
+            if (rh != null) dump(rh);
+
+            Class<?> touch = findFirst(lpp, TOUCH_HANDLER);
+            if (touch == null) {
+                log("PipTouchHandler NOT FOUND - pinch unavailable");
                 return;
             }
-            dump(c);
+            dump(touch);
 
-            XposedBridge.hookAllConstructors(c, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam p) {
-                    log("PipResizeGestureHandler constructed");
-                    forceEnable(p.thisObject);
-                    flush();
-                }
-            });
-            XposedBridge.hookAllMethods(c, "onActivityPinned", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam p) {
-                    log("onActivityPinned");
-                    forceEnable(p.thisObject);
-                    forceMinMaxFields(p.thisObject);
-                    flush();
-                }
-            });
-            XposedBridge.hookAllMethods(c, "onInputEvent", new XC_MethodHook() {
+            XC_MethodHook h = new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam p) {
-                    forceMinMaxFields(p.thisObject);
-                }
-            });
-
-            XC_MethodHook minHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    overrideSize(p, "min_percent", 30);
-                }
-            };
-            XC_MethodHook maxHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    overrideSize(p, "max_percent", 90);
+                    try {
+                        if (p.args.length != 1 || !(p.args[0] instanceof MotionEvent)) return;
+                        if (pinch == null || pinch.owner() != p.thisObject) {
+                            pinch = new PinchController(p.thisObject, prefs());
+                        }
+                        if (pinch.handle((MotionEvent) p.args[0], p)) {
+                            Class<?> rt = ((Method) p.method).getReturnType();
+                            p.setResult(rt == boolean.class ? (Object) Boolean.TRUE : null);
+                        }
+                    } catch (Throwable t) {
+                        logErr("pinch hook", t);
+                    }
                 }
             };
             int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                String name = m.getName().toLowerCase();
-                if (name.contains("minsize") && name.startsWith("update")) {
-                    XposedBridge.hookMethod(m, minHook);
+            for (Method m : touch.getDeclaredMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                boolean named = m.getName().equals("handleTouchEvent");
+                boolean shape = pt.length == 1 && pt[0] == InputEvent.class
+                        && m.getReturnType() == boolean.class;
+                if (named || shape) {
+                    XposedBridge.hookMethod(m, h);
                     n++;
-                } else if (name.contains("maxsize") && name.startsWith("update")) {
-                    XposedBridge.hookMethod(m, maxHook);
-                    n++;
+                    log("pinch: hooked " + m);
                 }
             }
-            log("min/max update-method hooks: " + n);
+            log("pinch: PipTouchHandler touch hooks = " + n);
         } catch (Throwable t) {
-            logErr("resize handler", t);
-        }
-    }
-
-    /** Turns on every boolean field that looks like an "enabled" flag, then re-inits input. */
-    private void forceEnable(Object handler) {
-        try {
-            if (!prefs().getBoolean("pinch_enabled", true)) return;
-            boolean changed = false;
-            Class<?> c = handler.getClass();
-            while (c != null && c != Object.class) {
-                for (Field f : c.getDeclaredFields()) {
-                    if (f.getType() == boolean.class
-                            && f.getName().toLowerCase().contains("enable")) {
-                        f.setAccessible(true);
-                        if (!f.getBoolean(handler)) {
-                            f.setBoolean(handler, true);
-                            changed = true;
-                            log("forced " + f.getName() + " = true");
-                        }
-                    }
-                }
-                c = c.getSuperclass();
-            }
-            if (changed) {
-                try {
-                    XposedHelpers.callMethod(handler, "updateIsEnabled");
-                    log("called updateIsEnabled()");
-                } catch (Throwable t) {
-                    log("updateIsEnabled() unavailable: " + t);
-                }
-            }
-        } catch (Throwable t) {
-            logErr("forceEnable", t);
-        }
-    }
-
-    /** Fallback: write min/max Point fields directly, keeping their aspect ratio. */
-    private void forceMinMaxFields(Object handler) {
-        try {
-            applyPointField(handler, "mMinSize", prefs().getInt("min_percent", 30));
-            applyPointField(handler, "mMaxSize", prefs().getInt("max_percent", 90));
-        } catch (Throwable t) {
-            logErr("forceMinMaxFields", t);
-        }
-    }
-
-    private void applyPointField(Object o, String name, int pct) throws Exception {
-        Field f = findField(o.getClass(), name);
-        if (f == null || f.getType() != Point.class) return;
-        f.setAccessible(true);
-        Point pt = (Point) f.get(o);
-        if (pt == null || pt.x <= 0 || pt.y <= 0) return;
-        float ratio = pt.y / (float) pt.x;
-        int nx = Math.round(screenWidthPx() * pct / 100f);
-        pt.x = nx;
-        pt.y = Math.round(nx * ratio);
-    }
-
-    private void overrideSize(XC_MethodHook.MethodHookParam p, String key, int def) {
-        try {
-            if (p.args.length < 2 || !(p.args[0] instanceof Integer)) return;
-            int origX = (Integer) p.args[0];
-            int origY = (Integer) p.args[1];
-            if (origX <= 0) return;
-            int pct = prefs().getInt(key, def);
-            int newX = Math.round(screenWidthPx() * pct / 100f);
-            int newY = Math.round(newX * (origY / (float) origX));
-            p.args[0] = newX;
-            p.args[1] = newY;
-        } catch (Throwable t) {
-            logErr("overrideSize", t);
+            logErr("hookPinch", t);
         }
     }
 
@@ -439,7 +315,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean dirty;
     private static long lastFlush;
 
-    private static synchronized void log(String s) {
+    static synchronized void log(String s) {
         XposedBridge.log(TAG + s);
         if (REPORT.length() > 150000) REPORT.delete(0, 50000);
         REPORT.append(s).append("\n\n");
